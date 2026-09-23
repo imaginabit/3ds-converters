@@ -160,9 +160,20 @@ If the GUI fails repeatedly, try the batch script fallback described above and k
 Original credits for the underlying tools and workflow:
 
 - 54634564 - decrypt.exe
-- profi200 - makerom and ctrtool
+- profi200 / jakcron - original makerom and ctrtool
 - matif - Batch CIA 3DS Decryptor batch flow
 - @xxmichibxx - Batch CIA 3DS Decryptor Redux
 - @rohithvishaal - original automation script
 
 Fork: [imaginabit/3ds-converters](https://github.com/imaginabit/3ds-converters)
+
+### Bundled tools
+
+| Tool | Upstream | License |
+|------|----------|---------|
+| `ctrtool` | [3DSGuy/Project_CTR](https://github.com/3DSGuy/Project_CTR) | MIT |
+| `makerom` | [3DSGuy/Project_CTR](https://github.com/3DSGuy/Project_CTR) | MIT |
+| `ctrdecrypt` | [shijimasoft/ctrdecrypt](https://github.com/shijimasoft/ctrdecrypt) | GPL-3.0 |
+| `decrypt.exe` | 54634564 | (see original credits) |
+
+`ctrdecrypt` is distributed under GPL-3.0: source is available at the upstream repository above.
