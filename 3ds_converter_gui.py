@@ -367,8 +367,18 @@ class ROMConverter:
         if stderr_text:
             logger.warning(stderr_text)
 
-        # Only newly-produced "-decrypted" files count as output; this never picks up the
-        # original source ROM or unrelated ROMs sitting in the same folder.
+        candidates = self._collect_decrypted_outputs(working_dir, excluded, rom_name_filter)
+        return self._deliver_decrypted_outputs(
+            working_dir, output_folder, candidates, move_outputs, "Batch decryption"
+        )
+
+    def _collect_decrypted_outputs(
+        self,
+        working_dir: Path,
+        excluded: set,
+        rom_name_filter: Optional[str],
+    ) -> list[Path]:
+        """Newly-produced '-decrypted' files only; never the source or unrelated ROMs."""
         candidates = []
         for candidate in sorted(working_dir.glob("*")):
             if not candidate.is_file() or candidate.resolve() in excluded:
@@ -381,14 +391,23 @@ class ROMConverter:
             if rom_name_filter and rom_name_filter.lower() not in name_lower:
                 continue
             candidates.append(candidate)
+        return candidates
 
+    def _deliver_decrypted_outputs(
+        self,
+        working_dir: Path,
+        output_folder: Path,
+        candidates: list[Path],
+        move_outputs: bool,
+        label: str,
+    ) -> tuple[bool, str]:
         if not candidates:
             return (False, "No decrypted output files were produced")
 
         same_dir = output_folder.resolve() == working_dir.resolve()
         if not move_outputs or same_dir:
             logger.info(f"Decrypted output left in place: {working_dir}")
-            return (True, f"Batch decryption completed; outputs are in {working_dir}")
+            return (True, f"{label} completed; outputs are in {working_dir}")
 
         output_folder.mkdir(parents=True, exist_ok=True)
         moved = []
@@ -404,7 +423,7 @@ class ROMConverter:
 
         if moved:
             logger.info(f"Moved {len(moved)} decrypted output file(s) to {output_folder}")
-            return (True, f"Batch decryption completed and outputs were moved to {output_folder}")
+            return (True, f"{label} completed; outputs moved to {output_folder}")
         return (False, "No decrypted output files were produced")
 
     async def _run_native_decrypt(
@@ -425,13 +444,7 @@ class ROMConverter:
             logger.error(str(e))
             return (False, str(e))
 
-        seeddb = self.bin_dir / "seeddb.bin"
-        # ctrdecrypt looks up seeddb.bin relative to cwd (and will panic/network without it)
-        local_seeddb = working_dir / "seeddb.bin"
-        seeded = False
-        if seeddb.exists() and not local_seeddb.exists():
-            shutil.copy2(seeddb, local_seeddb)
-            seeded = True
+        seeddb_path, seeded = self._stage_seeddb(working_dir)
         try:
             sources = sorted(
                 [*working_dir.glob("*.cia"), *working_dir.glob("*.cci"), *working_dir.glob("*.3ds")],
@@ -454,54 +467,34 @@ class ROMConverter:
             for src in targets:
                 try:
                     await self._native_decrypt_one(
-                        src, convert_to_cci, ctrtool, ctrdecrypt, makerom, local_seeddb if local_seeddb.exists() else seeddb
+                        src, convert_to_cci, ctrtool, ctrdecrypt, makerom, seeddb_path
                     )
                 except Exception as e:
                     logger.error(f"Native decrypt failed for {src.name}: {e}")
-                    # drop partial NCCH extracts
-                    for ncch in working_dir.glob("*.ncch"):
-                        ncch.unlink(missing_ok=True)
+                    self._cleanup_ncch(working_dir)
         finally:
             if seeded:
-                local_seeddb.unlink(missing_ok=True)
+                seeddb_path.unlink(missing_ok=True)
 
-        candidates = []
-        for candidate in sorted(working_dir.glob("*")):
-            if not candidate.is_file() or candidate.resolve() in excluded:
-                continue
-            if candidate.suffix.lower() not in {".cia", ".cci", ".3ds"}:
-                continue
-            name_lower = candidate.name.lower()
-            if "decrypted" not in name_lower:
-                continue
-            if rom_name_filter and rom_name_filter.lower() not in name_lower:
-                continue
-            candidates.append(candidate)
+        candidates = self._collect_decrypted_outputs(working_dir, excluded, rom_name_filter)
+        return self._deliver_decrypted_outputs(
+            working_dir, output_folder, candidates, move_outputs, "Native decryption"
+        )
 
-        if not candidates:
-            return (False, "No decrypted output files were produced")
+    def _stage_seeddb(self, working_dir: Path) -> tuple[Path, bool]:
+        """ctrdecrypt looks up seeddb.bin relative to cwd (and will panic/network without it)."""
+        seeddb = self.bin_dir / "seeddb.bin"
+        local_seeddb = working_dir / "seeddb.bin"
+        if seeddb.exists() and not local_seeddb.exists():
+            shutil.copy2(seeddb, local_seeddb)
+            return local_seeddb, True
+        return local_seeddb if local_seeddb.exists() else seeddb, False
 
-        same_dir = output_folder.resolve() == working_dir.resolve()
-        if not move_outputs or same_dir:
-            logger.info(f"Decrypted output left in place: {working_dir}")
-            return (True, f"Native decryption completed; outputs are in {working_dir}")
-
-        output_folder.mkdir(parents=True, exist_ok=True)
-        moved = []
-        for candidate in candidates:
-            try:
-                dest_path = output_folder / candidate.name
-                if dest_path.exists():
-                    dest_path.unlink()
-                shutil.move(str(candidate), str(dest_path))
-                moved.append(dest_path)
-            except Exception as e:
-                logger.error(f"Error moving decrypted output {candidate.name}: {e}")
-
-        if moved:
-            logger.info(f"Moved {len(moved)} decrypted output file(s) to {output_folder}")
-            return (True, f"Native decryption completed; outputs moved to {output_folder}")
-        return (False, "No decrypted output files were produced")
+    @staticmethod
+    def _cleanup_ncch(directory: Path) -> None:
+        """Drop leftover NCCH extracts from ctrdecrypt."""
+        for ncch in directory.glob("*.ncch"):
+            ncch.unlink(missing_ok=True)
 
     async def _native_decrypt_one(
         self,
@@ -513,52 +506,74 @@ class ROMConverter:
         seeddb: Path,
     ) -> None:
         """Decrypt one CIA/CCI/3DS with native tools (cia-unix style flow)."""
+        if src.suffix.lower() in {".cci", ".3ds"}:
+            await self._native_decrypt_cci(src, ctrdecrypt, makerom)
+        else:
+            await self._native_decrypt_cia(
+                src, convert_to_cci, ctrtool, ctrdecrypt, makerom, seeddb
+            )
+
+    async def _native_decrypt_cci(
+        self,
+        src: Path,
+        ctrdecrypt: Path,
+        makerom: Path,
+    ) -> None:
         cwd = src.parent
         stem = src.stem
         suffix = src.suffix.lower()
         logger.info(f"Native decrypt: {src.name}")
 
+        # ctrdecrypt panics on .cci extension (main.rs:370 Option::unwrap);
+        # same bytes work fine as .3ds — hardlink to a temp .3ds name.
+        # Always pass a name relative to cwd (absolute paths hit ENOENT).
+        run_name = src.name
+        tmp_3ds = None
+        if suffix == ".cci":
+            tmp_3ds = cwd / f"{stem}.tmp.3ds"
+            try:
+                if tmp_3ds.exists():
+                    tmp_3ds.unlink()
+                os.link(src, tmp_3ds)
+            except OSError:
+                shutil.copy2(src, tmp_3ds)
+            run_name = tmp_3ds.name
+        try:
+            code, out, err = await self.run_command([ctrdecrypt, run_name], cwd=cwd)
+        finally:
+            if tmp_3ds is not None:
+                tmp_3ds.unlink(missing_ok=True)
+        if code != 0:
+            raise RuntimeError(err or out or "ctrdecrypt failed")
+        ncch_parts = self._cci_parts(cwd, stem)
+        if not ncch_parts:
+            raise RuntimeError("ctrdecrypt produced no NCCH partitions")
+        args = [makerom, "-f", "cci", "-ignoresign", "-target", "p",
+                "-o", f"{stem}-decrypted.cci"]
+        for idx, ncch in ncch_parts:
+            # makerom args are relative to cwd
+            args += ["-i", f"{ncch.name}:{idx}:{idx}"]
+        code, out, err = await self.run_command(args, cwd=cwd)
+        if code != 0 or not (cwd / f"{stem}-decrypted.cci").exists():
+            raise RuntimeError(err or out or "makerom failed to build CCI")
+        self._cleanup_ncch(cwd)
+        logger.info(f"Native decrypt OK: {src.name}")
+
+    async def _native_decrypt_cia(
+        self,
+        src: Path,
+        convert_to_cci: bool,
+        ctrtool: Path,
+        ctrdecrypt: Path,
+        makerom: Path,
+        seeddb: Path,
+    ) -> None:
+        cwd = src.parent
+        stem = src.stem
+        logger.info(f"Native decrypt: {src.name}")
         # ctrdecrypt mis-builds output paths when given an absolute ROM path
         # (parent_dir + full_path → ENOENT). Always pass a name relative to cwd.
         rel_name = src.name
-
-        if suffix in {".cci", ".3ds"}:
-            # ctrdecrypt panics on .cci extension (main.rs:370 Option::unwrap);
-            # same bytes work fine as .3ds — hardlink to a temp .3ds name
-            run_name = rel_name
-            tmp_3ds = None
-            if suffix == ".cci":
-                tmp_3ds = cwd / f"{stem}.tmp.3ds"
-                try:
-                    if tmp_3ds.exists():
-                        tmp_3ds.unlink()
-                    os.link(src, tmp_3ds)
-                except OSError:
-                    shutil.copy2(src, tmp_3ds)
-                run_name = tmp_3ds.name
-            try:
-                code, out, err = await self.run_command([ctrdecrypt, run_name], cwd=cwd)
-            finally:
-                if tmp_3ds is not None:
-                    tmp_3ds.unlink(missing_ok=True)
-            if code != 0:
-                raise RuntimeError(err or out or "ctrdecrypt failed")
-            ncch_parts = self._cci_parts(cwd, stem)
-            if not ncch_parts:
-                raise RuntimeError("ctrdecrypt produced no NCCH partitions")
-            args = [makerom, "-f", "cci", "-ignoresign", "-target", "p",
-                    "-o", f"{stem}-decrypted.cci"]
-            for idx, ncch in ncch_parts:
-                # makerom args are relative to cwd
-                args += ["-i", f"{ncch.name}:{idx}:{idx}"]
-            code, out, err = await self.run_command(args, cwd=cwd)
-            if code != 0 or not (cwd / f"{stem}-decrypted.cci").exists():
-                raise RuntimeError(err or out or "makerom failed to build CCI")
-            for ncch in cwd.glob("*.ncch"):
-                ncch.unlink(missing_ok=True)
-            return
-
-        # CIA
         code, info, err = await self.run_command(
             [ctrtool, f"--seeddb={seeddb}", rel_name], cwd=cwd
         )
@@ -615,8 +630,7 @@ class ROMConverter:
             if code != 0 or not (cwd / cci_name).exists():
                 raise RuntimeError(err or out or "makerom failed CIA→CCI")
 
-        for ncch in cwd.glob("*.ncch"):
-            ncch.unlink(missing_ok=True)
+        self._cleanup_ncch(cwd)
         logger.info(f"Native decrypt OK: {src.name}")
 
     @staticmethod
@@ -1534,7 +1548,12 @@ def main():
     ConverterGUI(root)
     
     # Welcome message
-    welcome_msg = """
+    platform_line = (
+        "Platform: Windows (native .exe tools + batch)"
+        if IS_WINDOWS
+        else f"Platform: {platform.system()} — native tools (makerom/ctrtool/ctrdecrypt, no wine)"
+    )
+    welcome_msg = f"""
 ╔══════════════════════════════════════════════════════╗
 ║        3DS ROM Converter Pro - Modern Edition        ║
 ║  Convert CIA/CCI formats and decrypt ROMs for Citra ║
@@ -1554,17 +1573,8 @@ Features:
   ✓ Drag-and-drop ready
 
 Ready to convert ROMs!
-Platform: Windows (native .exe tools + batch)
-""" if IS_WINDOWS else """
-╔══════════════════════════════════════════════════════╗
-║        3DS ROM Converter Pro - Modern Edition        ║
-║  Convert CIA/CCI formats and decrypt ROMs for Citra  ║
-╚══════════════════════════════════════════════════════╝
-
-Platform: %s — native tools (makerom/ctrtool/ctrdecrypt, no wine)
-
-Ready to convert ROMs!
-""" % platform.system()
+{platform_line}
+"""
 
     logger.info(welcome_msg)
     root.mainloop()
