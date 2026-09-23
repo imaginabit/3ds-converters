@@ -4,6 +4,8 @@
 
 A modern GUI-based tool for converting 3DS ROM files between CIA and CCI formats and for decrypting them for use with Citra.
 
+**Runs on Windows and Linux** (Linux uses native tools, no wine/cmd needed).
+
 ![UI](screenshots/GUI.png)
 
 ## What this tool does
@@ -12,10 +14,20 @@ The current GUI workflow is implemented in [3ds_converter_gui.py](3ds_converter_
 
 - CCI to CIA conversion
 - CIA to CCI conversion
-- CCI decryption
+- CCI/3DS decryption
 - CIA to decrypted CCI conversion
 
 For the CCI-to-CIA and CIA-to-CCI flows, the script will first try the normal conversion and, if that fails, it will attempt a decrypt-first retry before trying again.
+
+## Recent changes
+
+- **Linux support**: on non-Windows, decryption runs through native `ctrdecrypt`/`ctrtool`/`makerom` binaries instead of the Windows batch script (no wine required).
+- **Cross-platform tool resolution**: tools are looked up as `bin/<name>` on Linux and `bin/<name>.exe` on Windows, with a clear error if missing; executable bits are set automatically on Linux.
+- **`.3ds` support in CCI decrypt**: folder CCI decryption now also picks up `.3ds` files, not only `.cci`.
+- **Auto conversion type**: selecting a single `.cia`/`.cci` file in the GUI pre-selects the matching conversion type so Start Conversion works without manual dropdown changes.
+- **seeddb handling**: `seeddb.bin` is temporarily placed next to the ROMs so `ctrdecrypt` can find it, then cleaned up.
+- **Native binaries added**: `bin/ctrdecrypt`, `bin/ctrtool`, `bin/makerom` (Linux x86-64) committed alongside the existing `.exe` tools.
+- **.gitignore**: ignore `ROMs/` and `__pycache__/` so local ROMs and caches are never committed.
 
 ## Features
 
@@ -24,19 +36,18 @@ For the CCI-to-CIA and CIA-to-CCI flows, the script will first try the normal co
 - Output folder selection
 - Real-time log window
 - Status bar and progress indicator
-- Automatic detection of available CCI and CIA files in a selected folder
+- Automatic detection of available CCI, 3DS and CIA files in a selected folder
 - Batch processing for multiple files and conversion types
 
 ## Requirements
 
 - Python 3.9 or higher
-- Windows operating system
-- The helper files must be available in the project folder or the bin folder:
-  - [bin/makerom.exe](bin/makerom.exe)
-  - [bin/ctrtool.exe](bin/ctrtool.exe)
-  - [bin/decrypt.exe](bin/decrypt.exe)
-  - [bin/seeddb.bin](bin/seeddb.bin)
-  - [Batch CIA 3DS Decryptor Redux.bat](Batch%20CIA%203DS%20Decryptor%20Redux.bat)
+- Windows or Linux (x86-64)
+- Helper files in the `bin` folder:
+  - **Windows:** `makerom.exe`, `ctrtool.exe`, `decrypt.exe`
+  - **Linux:** `makerom`, `ctrtool`, `ctrdecrypt`
+  - `seeddb.bin` (both platforms)
+  - [Batch CIA 3DS Decryptor Redux.bat](Batch%20CIA%203DS%20Decryptor%20Redux.bat) (Windows only)
 
 ## Installation
 
@@ -101,15 +112,14 @@ By default, converted files are written to the ROMs folder. You can choose anoth
 ```text
 3ds-converters/
 ├── 3ds_converter_gui.py
-├── 3ds.py
 ├── Batch CIA 3DS Decryptor Redux.bat
 ├── Launch_GUI.bat
 ├── bin/
-│   ├── makerom.exe
-│   ├── ctrtool.exe
-│   ├── decrypt.exe
+│   ├── makerom / makerom.exe
+│   ├── ctrtool / ctrtool.exe
+│   ├── ctrdecrypt / decrypt.exe
 │   └── seeddb.bin
-├── ROMs/
+├── ROMs/            (local, git-ignored)
 └── screenshots/
 ```
 
@@ -133,8 +143,8 @@ This is useful when you want a simpler, script-driven approach for decryption an
 ### Python is not recognized
 Install Python and make sure it is added to PATH.
 
-### makerom.exe or ctrtool.exe not found
-Make sure the files exist in the bin folder and that the batch script can access them.
+### makerom / ctrtool not found
+Make sure the tools exist in the `bin` folder (`bin/makerom` + `bin/ctrtool` on Linux, `bin/makerom.exe` + `bin/ctrtool.exe` on Windows).
 
 ### ROM not found
 Check that the ROM file is present in the selected source folder or that the correct file extension is being used (.cia or .cci).
@@ -150,7 +160,9 @@ If the GUI fails repeatedly, try the batch script fallback described above and k
 Original credits for the underlying tools and workflow:
 
 - 54634564 - decrypt.exe
-- profi200 - makerom.exe and ctrtool.exe
+- profi200 - makerom and ctrtool
 - matif - Batch CIA 3DS Decryptor batch flow
 - @xxmichibxx - Batch CIA 3DS Decryptor Redux
 - @rohithvishaal - original automation script
+
+Fork: [imaginabit/3ds-converters](https://github.com/imaginabit/3ds-converters)

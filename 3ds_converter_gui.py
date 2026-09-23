@@ -12,6 +12,9 @@ Rewritten with modern Python standards, async support, and GUI.
 """
 
 import asyncio
+import os
+import platform
+import re
 import shutil
 import logging
 from pathlib import Path
@@ -29,6 +32,21 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+IS_WINDOWS = platform.system() == "Windows"
+
+# Title IDs that cannot be packed into a CCI (mirrors the batch script).
+_NO_CCI_TITLES = {
+    "000400db", "0004001b", "0004009b", "00040010", "00040030",
+    "00040130", "0004000e", "0004008c", "00048005", "0004800f",
+    "00048004", "00040002",
+}
+
+_CCI_PART_INDEX = {
+    "main": 0, "manual": 1, "downloadplay": 2,
+    "partition4": 3, "partition5": 4, "partition6": 5,
+    "n3dsupdatedata": 6, "updatedata": 7,
+}
 
 
 class ConversionType(Enum):
@@ -56,8 +74,30 @@ class ROMConverter:
         self.rom_folder = Path(rom_folder)
         self.output_folder = self.rom_folder  # Default to rom_folder
         self.script_dir = Path(__file__).resolve().parent
-        self.makerom_exe = self.script_dir / "bin" / "makerom.exe"
+        self.bin_dir = self.script_dir / "bin"
+        if not IS_WINDOWS:
+            for name in ("makerom", "ctrtool", "ctrdecrypt"):
+                p = self.bin_dir / name
+                if p.exists():
+                    p.chmod(p.stat().st_mode | 0o111)
+        self.makerom_exe = self.tool("makerom")
         self.ensure_folders()
+
+    def tool(self, name: str) -> Path:
+        """Resolve a helper tool for the current OS (native binary vs .exe)."""
+        candidates = (
+            [self.bin_dir / f"{name}.exe", self.bin_dir / name]
+            if IS_WINDOWS
+            else [self.bin_dir / name, self.bin_dir / f"{name}.exe"]
+        )
+        for path in candidates:
+            if path.exists():
+                return path
+        # ponytail: single clear error beats a later Permission/FileNotFound
+        raise FileNotFoundError(
+            f"Tool '{name}' not found in {self.bin_dir} "
+            f"(expected {'bin/' + name if not IS_WINDOWS else 'bin/' + name + '.exe'})"
+        )
         
     def ensure_folders(self) -> None:
         """Ensure ROM folder exists."""
@@ -289,8 +329,18 @@ class ROMConverter:
         if output_folder is None:
             output_folder = self.output_folder
         excluded = {p.resolve() for p in (exclude_paths or set())}
-
         working_dir = self.rom_folder
+
+        if not IS_WINDOWS:
+            return await self._run_native_decrypt(
+                working_dir,
+                output_folder,
+                convert_to_cci=convert_to_cci,
+                move_outputs=move_outputs,
+                rom_name_filter=rom_name_filter,
+                excluded=excluded,
+            )
+
         batch_script = self.prepare_batch_runtime(working_dir)
         if batch_script is None:
             msg = "Batch decryptor script not found or could not be prepared"
@@ -356,6 +406,255 @@ class ROMConverter:
             logger.info(f"Moved {len(moved)} decrypted output file(s) to {output_folder}")
             return (True, f"Batch decryption completed and outputs were moved to {output_folder}")
         return (False, "No decrypted output files were produced")
+
+    async def _run_native_decrypt(
+        self,
+        working_dir: Path,
+        output_folder: Path,
+        convert_to_cci: bool,
+        move_outputs: bool,
+        rom_name_filter: Optional[str],
+        excluded: set,
+    ) -> tuple[bool, str]:
+        """Linux/macOS decrypt path using native ctrtool/ctrdecrypt/makerom (no wine/cmd)."""
+        try:
+            ctrtool = self.tool("ctrtool")
+            ctrdecrypt = self.tool("ctrdecrypt")
+            makerom = self.tool("makerom")
+        except FileNotFoundError as e:
+            logger.error(str(e))
+            return (False, str(e))
+
+        seeddb = self.bin_dir / "seeddb.bin"
+        # ctrdecrypt looks up seeddb.bin relative to cwd (and will panic/network without it)
+        local_seeddb = working_dir / "seeddb.bin"
+        seeded = False
+        if seeddb.exists() and not local_seeddb.exists():
+            shutil.copy2(seeddb, local_seeddb)
+            seeded = True
+        try:
+            sources = sorted(
+                [*working_dir.glob("*.cia"), *working_dir.glob("*.cci"), *working_dir.glob("*.3ds")],
+                key=lambda p: p.name.lower(),
+            )
+            # excluded is only for output candidates (original source must not count
+            # as a decrypted result); inputs are selected by rom_name_filter alone
+            targets = []
+            for src in sources:
+                if "decrypted" in src.name.lower():
+                    continue
+                if rom_name_filter and rom_name_filter.lower() not in src.name.lower():
+                    continue
+                targets.append(src)
+
+            if not targets:
+                return (False, "No matching ROM files to decrypt")
+
+            logger.info(f"Native decrypt: {len(targets)} file(s) with ctrdecrypt/makerom...")
+            for src in targets:
+                try:
+                    await self._native_decrypt_one(
+                        src, convert_to_cci, ctrtool, ctrdecrypt, makerom, local_seeddb if local_seeddb.exists() else seeddb
+                    )
+                except Exception as e:
+                    logger.error(f"Native decrypt failed for {src.name}: {e}")
+                    # drop partial NCCH extracts
+                    for ncch in working_dir.glob("*.ncch"):
+                        ncch.unlink(missing_ok=True)
+        finally:
+            if seeded:
+                local_seeddb.unlink(missing_ok=True)
+
+        candidates = []
+        for candidate in sorted(working_dir.glob("*")):
+            if not candidate.is_file() or candidate.resolve() in excluded:
+                continue
+            if candidate.suffix.lower() not in {".cia", ".cci", ".3ds"}:
+                continue
+            name_lower = candidate.name.lower()
+            if "decrypted" not in name_lower:
+                continue
+            if rom_name_filter and rom_name_filter.lower() not in name_lower:
+                continue
+            candidates.append(candidate)
+
+        if not candidates:
+            return (False, "No decrypted output files were produced")
+
+        same_dir = output_folder.resolve() == working_dir.resolve()
+        if not move_outputs or same_dir:
+            logger.info(f"Decrypted output left in place: {working_dir}")
+            return (True, f"Native decryption completed; outputs are in {working_dir}")
+
+        output_folder.mkdir(parents=True, exist_ok=True)
+        moved = []
+        for candidate in candidates:
+            try:
+                dest_path = output_folder / candidate.name
+                if dest_path.exists():
+                    dest_path.unlink()
+                shutil.move(str(candidate), str(dest_path))
+                moved.append(dest_path)
+            except Exception as e:
+                logger.error(f"Error moving decrypted output {candidate.name}: {e}")
+
+        if moved:
+            logger.info(f"Moved {len(moved)} decrypted output file(s) to {output_folder}")
+            return (True, f"Native decryption completed; outputs moved to {output_folder}")
+        return (False, "No decrypted output files were produced")
+
+    async def _native_decrypt_one(
+        self,
+        src: Path,
+        convert_to_cci: bool,
+        ctrtool: Path,
+        ctrdecrypt: Path,
+        makerom: Path,
+        seeddb: Path,
+    ) -> None:
+        """Decrypt one CIA/CCI/3DS with native tools (cia-unix style flow)."""
+        cwd = src.parent
+        stem = src.stem
+        suffix = src.suffix.lower()
+        logger.info(f"Native decrypt: {src.name}")
+
+        # ctrdecrypt mis-builds output paths when given an absolute ROM path
+        # (parent_dir + full_path → ENOENT). Always pass a name relative to cwd.
+        rel_name = src.name
+
+        if suffix in {".cci", ".3ds"}:
+            # ctrdecrypt panics on .cci extension (main.rs:370 Option::unwrap);
+            # same bytes work fine as .3ds — hardlink to a temp .3ds name
+            run_name = rel_name
+            tmp_3ds = None
+            if suffix == ".cci":
+                tmp_3ds = cwd / f"{stem}.tmp.3ds"
+                try:
+                    if tmp_3ds.exists():
+                        tmp_3ds.unlink()
+                    os.link(src, tmp_3ds)
+                except OSError:
+                    shutil.copy2(src, tmp_3ds)
+                run_name = tmp_3ds.name
+            try:
+                code, out, err = await self.run_command([ctrdecrypt, run_name], cwd=cwd)
+            finally:
+                if tmp_3ds is not None:
+                    tmp_3ds.unlink(missing_ok=True)
+            if code != 0:
+                raise RuntimeError(err or out or "ctrdecrypt failed")
+            ncch_parts = self._cci_parts(cwd, stem)
+            if not ncch_parts:
+                raise RuntimeError("ctrdecrypt produced no NCCH partitions")
+            args = [makerom, "-f", "cci", "-ignoresign", "-target", "p",
+                    "-o", f"{stem}-decrypted.cci"]
+            for idx, ncch in ncch_parts:
+                # makerom args are relative to cwd
+                args += ["-i", f"{ncch.name}:{idx}:{idx}"]
+            code, out, err = await self.run_command(args, cwd=cwd)
+            if code != 0 or not (cwd / f"{stem}-decrypted.cci").exists():
+                raise RuntimeError(err or out or "makerom failed to build CCI")
+            for ncch in cwd.glob("*.ncch"):
+                ncch.unlink(missing_ok=True)
+            return
+
+        # CIA
+        code, info, err = await self.run_command(
+            [ctrtool, f"--seeddb={seeddb}", rel_name], cwd=cwd
+        )
+        if code != 0:
+            raise RuntimeError(err or info or "ctrtool failed")
+        title_id = self._field(info, r"Title id:\s+([0-9a-fA-F]+)") or self._field(
+            info, r"TitleId:\s+([0-9a-fA-F]+)"
+        ) or ""
+        title_id_l = title_id.lower()
+        ver_match = re.search(r"TitleVersion:.*\((\d+)\)", info)
+        version = ver_match.group(1) if ver_match else None
+
+        if title_id_l[:8] in _NO_CCI_TITLES and convert_to_cci:
+            logger.warning(f"{src.name}: title {title_id} cannot be converted to CCI; skipping")
+            return
+
+        code, out, err = await self.run_command([ctrdecrypt, rel_name], cwd=cwd)
+        if code != 0:
+            raise RuntimeError(err or out or "ctrdecrypt failed")
+
+        ncch_parts = self._cia_parts(cwd, stem)
+        if not ncch_parts:
+            raise RuntimeError("ctrdecrypt produced no NCCH partitions")
+
+        is_dlc = title_id_l.startswith("0004008c")
+        is_patch = title_id_l.startswith("0004000e")
+        label = "DLC" if is_dlc else ("Patch" if is_patch else "Game")
+        # Names must match find_decrypted_output: {rom_name}*-decrypted.{ext}
+        if convert_to_cci:
+            mid_cia = f"{stem} {label}-decfirst.cia"
+        else:
+            mid_cia = f"{stem} {label}-decrypted.cia" if label != "Game" else f"{stem}-decrypted.cia"
+
+        args = [makerom, "-f", "cia"]
+        if is_dlc:
+            args.append("-dlc")
+        args += ["-ignoresign", "-target", "p", "-o", mid_cia]
+        for idx, ncch in ncch_parts:
+            args += ["-i", f"{ncch.name}:{idx}:{idx}"]
+        if version:
+            args += ["-ver", version]
+        code, out, err = await self.run_command(args, cwd=cwd)
+        mid_path = cwd / mid_cia
+        if code != 0 or not mid_path.exists():
+            raise RuntimeError(err or out or "makerom failed to build CIA")
+
+        if convert_to_cci:
+            cci_name = f"{stem}-decrypted.cci"
+            code, out, err = await self.run_command(
+                [makerom, "-ciatocci", mid_cia, "-o", cci_name],
+                cwd=cwd,
+            )
+            mid_path.unlink(missing_ok=True)
+            if code != 0 or not (cwd / cci_name).exists():
+                raise RuntimeError(err or out or "makerom failed CIA→CCI")
+
+        for ncch in cwd.glob("*.ncch"):
+            ncch.unlink(missing_ok=True)
+        logger.info(f"Native decrypt OK: {src.name}")
+
+    @staticmethod
+    def _field(text: str, pattern: str) -> Optional[str]:
+        m = re.search(pattern, text)
+        return m.group(1) if m else None
+
+    @staticmethod
+    def _cia_parts(cwd: Path, stem: str) -> list[tuple[int, Path]]:
+        """ctrdecrypt CIA output: '{stem}.{contentIndex}.ncch'."""
+        parts = []
+        for ncch in cwd.glob(f"{stem}.*.ncch"):
+            m = re.match(re.escape(stem) + r"\.(\d+)\.ncch$", ncch.name)
+            if m:
+                parts.append((int(m.group(1)), ncch))
+        parts.sort(key=lambda t: t[0])
+        return parts
+
+    @staticmethod
+    def _cci_parts(cwd: Path, stem: str) -> list[tuple[int, Path]]:
+        """ctrdecrypt CCI/3DS output uses named partitions (Main/Manual/...)."""
+        parts = []
+        for ncch in cwd.glob("*.ncch"):
+            name = ncch.stem  # e.g. 'Foo.Main' or 'Foo.0'
+            if name.startswith(f"{stem}."):
+                part = name[len(stem) + 1:].lower()
+            else:
+                part = name.lower()
+            if part in _CCI_PART_INDEX:
+                parts.append((_CCI_PART_INDEX[part], ncch))
+            elif part.isdigit():
+                parts.append((int(part), ncch))
+        # Fall back to any leftover numeric/name mapping by order
+        if not parts:
+            ordered = sorted(cwd.glob("*.ncch"), key=lambda p: p.name)
+            parts = list(enumerate(ordered))
+        parts.sort(key=lambda t: t[0])
+        return parts
 
     async def decrypt_rom_file(self, rom_name: str, output_folder: Optional[Path] = None, convert_to_cci: bool = False, move_outputs: bool = True) -> tuple[bool, str, Optional[Path]]:
         """Decrypt a ROM file using the batch script before conversion."""
@@ -486,9 +785,12 @@ class ROMConverter:
         """Decrypt all CCI files using the same batch flow as the .bat script."""
         logger.info("Starting CCI decryption process...")
         
-        cci_files = list(self.rom_folder.glob("*.cci"))
+        cci_files = [
+            *self.rom_folder.glob("*.cci"),
+            *self.rom_folder.glob("*.3ds"),
+        ]
         if not cci_files:
-            msg = "No CCI files found for decryption"
+            msg = "No CCI/3DS files found for decryption"
             logger.warning(msg)
             return (False, msg)
         
@@ -859,6 +1161,12 @@ class ConverterGUI:
             rom_path = Path(file)
             self.selected_rom_file = rom_path  # ← Store FULL path with directory
             self.rom_name_var.set(rom_path.name)  # ← Display WITH extension
+            # Pick a conversion type that matches the selected extension so we don't
+            # fail with "file.cci not found" when the user picked a .cia (or vice versa).
+            if rom_path.suffix.lower() == ".cia":
+                self.conversion_var.set(ConversionType.CIA_TO_CCI.value)
+            elif rom_path.suffix.lower() == ".cci":
+                self.conversion_var.set(ConversionType.CCI_TO_CIA.value)
             self.status_var.set(f"Selected: {rom_path.name}")
             logger.info(f"Selected ROM file: {rom_path.name} from {rom_path.parent}")
     
@@ -1246,8 +1554,18 @@ Features:
   ✓ Drag-and-drop ready
 
 Ready to convert ROMs!
-"""
-    
+Platform: Windows (native .exe tools + batch)
+""" if IS_WINDOWS else """
+╔══════════════════════════════════════════════════════╗
+║        3DS ROM Converter Pro - Modern Edition        ║
+║  Convert CIA/CCI formats and decrypt ROMs for Citra  ║
+╚══════════════════════════════════════════════════════╝
+
+Platform: %s — native tools (makerom/ctrtool/ctrdecrypt, no wine)
+
+Ready to convert ROMs!
+""" % platform.system()
+
     logger.info(welcome_msg)
     root.mainloop()
 
