@@ -27,6 +27,7 @@ For the CCI-to-CIA and CIA-to-CCI flows, the script will first try the normal co
 - **Auto conversion type**: selecting a single `.cia`/`.cci` file in the GUI pre-selects the matching conversion type so Start Conversion works without manual dropdown changes.
 - **seeddb handling**: `seeddb.bin` is temporarily placed next to the ROMs so `ctrdecrypt` can find it, then cleaned up.
 - **Native binaries added**: `bin/ctrdecrypt`, `bin/ctrtool`, `bin/makerom` (Linux x86-64) committed alongside the existing `.exe` tools.
+- **Shell script counterparts**: `Launch_GUI.sh`, `3DS_Converter.sh` and `Batch CIA 3DS Decryptor Redux.sh` mirror the `.bat` scripts for Linux (native tools, no wine).
 - **.gitignore**: ignore `ROMs/` and `__pycache__/` so local ROMs and caches are never committed.
 
 ## Features
@@ -47,7 +48,7 @@ For the CCI-to-CIA and CIA-to-CCI flows, the script will first try the normal co
   - **Windows:** `makerom.exe`, `ctrtool.exe`, `decrypt.exe`
   - **Linux:** `makerom`, `ctrtool`, `ctrdecrypt`
   - `seeddb.bin` (both platforms)
-  - [Batch CIA 3DS Decryptor Redux.bat](Batch%20CIA%203DS%20Decryptor%20Redux.bat) (Windows only)
+  - Decryptor script: [Batch CIA 3DS Decryptor Redux.bat](Batch%20CIA%203DS%20Decryptor%20Redux.bat) (Windows) or [Batch CIA 3DS Decryptor Redux.sh](Batch%20CIA%203DS%20Decryptor%20Redux.sh) (Linux)
 
 ## Installation
 
@@ -55,10 +56,16 @@ For the CCI-to-CIA and CIA-to-CCI flows, the script will first try the normal co
 Download and install Python from python.org and make sure Python is added to PATH.
 
 ### 2. Verify Python is available
-Run this in PowerShell:
+Windows (PowerShell):
 
 ```powershell
 python --version
+```
+
+Linux/macOS:
+
+```bash
+python3 --version
 ```
 
 ### 3. Place the required files in the project folder
@@ -66,16 +73,18 @@ The GUI expects the batch script and tools to be available so it can launch them
 
 ## Running the GUI
 
-From the project folder, run:
+From the project folder:
 
-```powershell
+```bash
+# Windows
 python 3ds_converter_gui.py
-```
-
-You can also launch it with:
-
-```powershell
+# or
 Launch_GUI.bat
+
+# Linux/macOS
+python3 3ds_converter_gui.py
+# or
+./Launch_GUI.sh
 ```
 
 ## Using the GUI
@@ -112,8 +121,9 @@ By default, converted files are written to the ROMs folder. You can choose anoth
 ```text
 3ds-converters/
 ├── 3ds_converter_gui.py
-├── Batch CIA 3DS Decryptor Redux.bat
-├── Launch_GUI.bat
+├── Batch CIA 3DS Decryptor Redux.bat / .sh
+├── Launch_GUI.bat / .sh
+├── 3DS_Converter.bat / .sh
 ├── bin/
 │   ├── makerom / makerom.exe
 │   ├── ctrtool / ctrtool.exe
@@ -125,13 +135,19 @@ By default, converted files are written to the ROMs folder. You can choose anoth
 
 ## Fallback option if the GUI fails
 
-If the GUI script does not complete successfully, you can fall back to the batch script directly.
+If the GUI script does not complete successfully, you can fall back to the decryptor script directly.
 
-1. Place the ROM files in the same folder as [Batch CIA 3DS Decryptor Redux.bat](Batch%20CIA%203DS%20Decryptor%20Redux.bat).
-2. Double-click the batch file or run it from PowerShell:
+1. Place the ROM files in the same folder as the decryptor script.
+2. Run it:
 
 ```powershell
+# Windows
 ./Batch CIA 3DS Decryptor Redux.bat
+```
+
+```bash
+# Linux/macOS
+./Batch\ CIA\ 3DS\ Decryptor\ Redux.sh
 ```
 
 3. Follow the prompts in the console window.
@@ -152,8 +168,8 @@ Check that the ROM file is present in the selected source folder or that the cor
 ### Conversion seems slow
 Some conversions can take several minutes. The GUI remains responsive while work is running.
 
-### The batch script is easier to use in some cases
-If the GUI fails repeatedly, try the batch script fallback described above and keep the ROMs in the same folder as the batch script.
+### The decryptor script is easier to use in some cases
+If the GUI fails repeatedly, try the decryptor script fallback described above and keep the ROMs in the same folder as the script.
 
 ## Credits
 
